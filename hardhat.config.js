@@ -1,9 +1,14 @@
+require("@nomicfoundation/hardhat-toolbox");
+
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
-  solidity: "0.8.24",
+  solidity: "0.8.13",
   networks: {
     hardhat: {
-      // This is the default network when you run `npx hardhat node`
+      accounts: {
+        count: 10, // Number of accounts to generate
+        accountsBalance: "10000000000000000000000" // 10000 ETH
+      }
     }
   }
 };
