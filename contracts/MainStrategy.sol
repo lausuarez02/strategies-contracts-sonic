@@ -8,57 +8,13 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./interfaces/ILending.sol";
 import "./interfaces/IBeefyVaultV7.sol";
 import "./interfaces/IStrategyV7.sol";
-
-interface IOriginSonic {
-    function stake(uint256 amount) external;
-    function getStakedAmount(address user) external view returns (uint256);
-    function unstake(uint256 amount) external;
-}
-
-interface ILendingProtocol {
-    function depositCollateral(address token, uint256 amount) external;
-    function borrow(address token, uint256 amount) external;
-    function repay(address token, uint256 amount) external;
-    function withdrawCollateral(address token, uint256 amount) external;
-}
-
-interface IFarm {
-    function deposit(uint256 amount) external;
-    function withdraw(uint256 amount) external;
-    function claimRewards() external;
-}
-
-interface IBeefyVault {
-    function deposit(uint256 amount) external;
-    function withdraw(uint256 shares) external;
-}
-
-interface IOracle {
-    function getPrice(address token) external view returns (uint256);
-}
-
-interface ISonicStakingStrategy {
-    function stake(uint256 amount) external;
-    function unstake(uint256 amount) external;
-    function getStakedBalance(address account) external view returns (uint256);
-    function getRewards() external;
-    // Add any other functions from the actual contract
-}
-
-interface ISFC {
-    function delegate(uint256 validatorID) external payable;
-    function undelegate(uint256 validatorID, uint256 wrID, uint256 amount) external;
-    function withdraw(uint256 validatorID, uint256 wrID) external;
-    function getStake(address delegator, uint256 validatorID) external view returns (uint256);
-    function pendingRewards(address delegator, uint256 validatorID) external view returns (uint256);
-    function claimRewards(uint256 validatorID) external;
-    function restakeRewards(uint256 validatorID) external;
-}
-
-interface IWrappedSonic {
-    function deposit() external payable;
-    function withdraw(uint256 amount) external;
-}
+import "./interfaces/IWrappedSonic.sol";
+import "./interfaces/ISFC.sol";
+import "./interfaces/IBeefyVaultV7.sol";
+import "./interfaces/IStrategyV7.sol";
+import "./interfaces/ILending.sol";
+import "./interfaces/IOriginSonic.sol";
+import "./interfaces/ILendingProtocol.sol";
 
 contract SonicBeefyStrategy is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
