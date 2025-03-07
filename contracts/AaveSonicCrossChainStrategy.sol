@@ -5,28 +5,15 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interfaces/ILending.sol";
+import "./interfaces/IDebridgeGateway.sol";
+import "./interfaces/ISonicFarm.sol";
+import "./interfaces/IAaveLendingPool.sol";
 
-interface IAaveLendingPool {
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-    function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf) external;
-    function repay(address asset, uint256 amount, uint256 rateMode, address onBehalfOf) external;
-    function withdraw(address asset, uint256 amount, address to) external;
-}
-
-interface IDebridgeGateway {
-    function send(address token, uint256 amount, uint256 dstChainId, address receiver, bytes calldata autoParams) external payable returns (bytes32);
-    function claim(bytes32 debridgeId, bytes calldata signatures, bytes calldata reserveProof) external;
-}
-
-interface ISonicFarm {
-    function deposit(uint256 amount) external;
-    function withdraw(uint256 amount) external;
-    function claimRewards() external;
-}
-
-contract AaveSonicCrossChainStrategy is AccessControl, ReentrancyGuard {
+abstract contract AaveSonicCrossChainStrategy is ILending, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
     
     IERC20 public immutable asset;
@@ -46,12 +33,14 @@ contract AaveSonicCrossChainStrategy is AccessControl, ReentrancyGuard {
     event RepaidToAave(uint256 amount);
 
     constructor(
+        address _vault,
         address _asset,
         address _aaveLendingPool,
         address _deBridge,
         address _sonicFarm,
         uint256 _destinationChainId
     ) {
+        require(_vault != address(0), "Invalid vault");
         require(_asset != address(0), "Invalid asset");
         require(_aaveLendingPool != address(0), "Invalid Aave pool");
         require(_deBridge != address(0), "Invalid deBridge");
@@ -64,10 +53,15 @@ contract AaveSonicCrossChainStrategy is AccessControl, ReentrancyGuard {
         destinationChainId = _destinationChainId;
         
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(VAULT_ROLE, _vault);
         _grantRole(MANAGER_ROLE, msg.sender);
     }
 
-    function supplyToAave(uint256 amount) external nonReentrant onlyRole(MANAGER_ROLE) {
+    // Implement ILending interface
+    function deposit(address _asset, uint256 amount) external override onlyRole(VAULT_ROLE) {
+        require(_asset == address(asset), "Invalid asset");
+        require(amount > 0, "Zero amount");
+
         asset.safeTransferFrom(msg.sender, address(this), amount);
         asset.approve(address(aaveLendingPool), amount);
         aaveLendingPool.supply(address(asset), amount, address(this), 0);
@@ -75,31 +69,51 @@ contract AaveSonicCrossChainStrategy is AccessControl, ReentrancyGuard {
         emit Supplied(amount);
     }
 
-    function borrowAndBridge(uint256 amount) external nonReentrant onlyRole(MANAGER_ROLE) {
+    function withdraw(address _asset, uint256 amount) external override onlyRole(VAULT_ROLE) {
+        require(_asset == address(asset), "Invalid asset");
+        require(amount > 0, "Zero amount");
+        require(amount <= totalSupplied, "Insufficient balance");
+
+        aaveLendingPool.withdraw(address(asset), amount, msg.sender);
+        totalSupplied -= amount;
+        emit WithdrawnFromSonic(amount);
+    }
+
+    // Strategy-specific functions
+    function borrowAndBridge(uint256 amount) external onlyRole(MANAGER_ROLE) {
+        require(amount <= totalSupplied * 75 / 100, "Exceeds borrow limit"); // 75% LTV limit
+        
         aaveLendingPool.borrow(address(asset), amount, 2, 0, address(this));
         asset.approve(address(deBridge), amount);
         deBridge.send(address(asset), amount, destinationChainId, address(this), "");
         totalBorrowed += amount;
+        
         emit Borrowed(amount);
         emit BridgedToSonic(amount);
     }
 
-    function farmInSonic(uint256 amount) external nonReentrant onlyRole(MANAGER_ROLE) {
+    function farmInSonic(uint256 amount) external onlyRole(MANAGER_ROLE) {
         asset.approve(address(sonicFarm), amount);
         sonicFarm.deposit(amount);
         emit FarmedInSonic(amount);
     }
 
-    function withdrawAndRepay(uint256 amount) external nonReentrant onlyRole(MANAGER_ROLE) {
+    function withdrawAndRepay(uint256 amount) external onlyRole(MANAGER_ROLE) {
+        require(amount <= totalBorrowed, "Exceeds borrowed amount");
+        
         sonicFarm.withdraw(amount);
-        // Bridge back to source chain would go here
         aaveLendingPool.repay(address(asset), amount, 2, address(this));
         totalBorrowed -= amount;
+        
         emit WithdrawnFromSonic(amount);
         emit RepaidToAave(amount);
+    }
+
+    function getTotalAssets() external view returns (uint256) {
+        return totalSupplied - totalBorrowed;
     }
 
     function setDestinationChainId(uint256 _destinationChainId) external onlyRole(DEFAULT_ADMIN_ROLE) {
         destinationChainId = _destinationChainId;
     }
-} 
+}
