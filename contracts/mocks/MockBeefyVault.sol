@@ -1,54 +1,68 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import "../interfaces/IBeefyVault.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "../interfaces/IBeefyVaultV7.sol";
 
-contract MockBeefyVault is IBeefyVaultV7 {
-    IERC20 public override want;
-    mapping(address => uint256) public override balanceOf;
-    uint256 public override totalSupply;
-    address public override strategy;
+contract MockBeefyVault {
+    uint256 private _balance;
+    uint256 private _depositResult;
+    uint256 private _withdrawResult;
+    address private _beefyStrategy;
+    IERC20 public token;
 
-    constructor(address _want, address _strategy) {
-        want = IERC20(_want);
-        strategy = _strategy;
+    constructor(address _token) {
+        token = IERC20(_token);
     }
 
-    function deposit(uint256 _amount) external override {
-        want.transferFrom(msg.sender, address(this), _amount);
-        balanceOf[msg.sender] += _amount;
-        totalSupply += _amount;
+    function setDepositResult(uint256 amount) external {
+        _depositResult = amount;
     }
 
-    function withdraw(uint256 _shares) external override {
-        require(balanceOf[msg.sender] >= _shares, "Insufficient balance");
-        balanceOf[msg.sender] -= _shares;
-        totalSupply -= _shares;
-        want.transfer(msg.sender, _shares);
+    function setWithdrawResult(uint256 amount) external {
+        _withdrawResult = amount;
     }
 
-    function balance() external view override returns (uint256) {
-        return want.balanceOf(address(this));
+    function setBeefyStrategy(address strategy) external {
+        _beefyStrategy = strategy;
     }
 
-    function available() external view override returns (uint256) {
-        return want.balanceOf(address(this));
+    function deposit(uint256 amount) external returns (uint256) {
+        token.transferFrom(msg.sender, address(this), amount);
+        _balance += amount;
+        return _depositResult > 0 ? _depositResult : amount;
     }
 
-    function getPricePerFullShare() external pure override returns (uint256) {
+    function withdraw(uint256 amount) external returns (uint256) {
+        require(_balance >= amount, "Insufficient balance");
+        _balance -= amount;
+        token.transfer(msg.sender, amount);
+        return _withdrawResult > 0 ? _withdrawResult : amount;
+    }
+
+    function balance() external view returns (uint256) {
+        return _balance;
+    }
+
+    function strategy() external view returns (address) {
+        return _beefyStrategy;
+    }
+
+    function want() external view returns (address) {
+        return address(token);
+    }
+
+    function getPricePerFullShare() external pure returns (uint256) {
         return 1e18;
     }
 
-    function depositAll() external override {
-        uint256 wantBalance = want.balanceOf(msg.sender);
-        this.deposit(wantBalance);
+    function totalSupply() external pure returns (uint256) {
+        return 1000e18;
     }
 
-    function withdrawAll() external override {
-        uint256 userBalance = balanceOf[msg.sender];
-        this.withdraw(userBalance);
+    function balanceOf(address) external pure returns (uint256) {
+        return 100e18;
     }
 
-    function earn() external override {}
+    function earn() external {}
 } 

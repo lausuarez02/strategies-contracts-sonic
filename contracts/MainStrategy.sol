@@ -16,7 +16,7 @@ import "./interfaces/ILending.sol";
 import "./interfaces/IOriginSonic.sol";
 import "./interfaces/ILendingProtocol.sol";
 
-contract SonicBeefyStrategy is AccessControl, ReentrancyGuard {
+contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
