@@ -15,6 +15,7 @@ import "./interfaces/IStrategyV7.sol";
 import "./interfaces/ILending.sol";
 import "./interfaces/IOriginSonic.sol";
 import "./interfaces/ILendingProtocol.sol";
+import "./interfaces/IDeBridgeGate.sol";
 
 contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -26,6 +27,8 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
     IStrategyV7 public beefyStrategy;
     ISFC public immutable sfc;
     IWrappedSonic public immutable wrappedSonic;
+    IERC20 public immutable USDC;
+    IDeBridgeGate public immutable debridge;
     
     uint256 public defaultValidatorId;
     uint256 public nextWithdrawId;
@@ -68,9 +71,13 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
         address _sfc,
         address _wrappedSonic,
         uint256 _defaultValidatorId,
-        address _beefyVault
+        address _beefyVault,
+        address _usdc,
+        address _deBridge
     ) {
         require(_beefyVault != address(0), "Zero beefy vault");
+        require(_deBridge != address(0), "Zero deBridge");
+        require(_usdc != address(0), "Zero USDC");
         
         beefyVault = IBeefyVaultV7(_beefyVault);
         beefyStrategy = IStrategyV7(beefyVault.strategy());
@@ -78,6 +85,8 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
         sfc = ISFC(_sfc);
         wrappedSonic = IWrappedSonic(_wrappedSonic);
         defaultValidatorId = _defaultValidatorId;
+        USDC = IERC20(_usdc);
+        debridge = IDeBridgeGate(_deBridge);
         
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(VAULT_ROLE, _vault);
@@ -117,7 +126,7 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
         emit Unstaked(defaultValidatorId, withdrawId, amount);
     }
 
-    function withdraw(uint256 withdrawId) external onlyVault nonReentrant {
+    function withdrawFromSFC(uint256 withdrawId) external onlyVault nonReentrant {
         require(withdrawId < nextWithdrawId, "Invalid withdrawId");
         WithdrawRequest storage request = withdrawals[withdrawId];
         require(request.undelegatedAmount > 0, "Already withdrawn");
@@ -163,32 +172,30 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
         return sfc.pendingRewards(address(this), defaultValidatorId);
     }
 
-    function depositToBeefyVault(uint256 amount) external onlyRole(VAULT_ROLE) nonReentrant {
-        require(!paused, "Strategy is paused");
+    function _swapWSonicToUSDC(uint256 amount) internal returns (uint256) {
         require(amount > 0, "Zero amount");
         
-        // Get initial balance for actual deposit amount calculation
-        uint256 balanceBefore = beefyVault.balance();
+        // Approve OpenOcean to spend WSONIC
+        IERC20(address(wrappedSonic)).safeApprove(address(debridge), amount);
         
-        // Approve and deposit
-        IERC20(address(wrappedSonic)).safeApprove(address(beefyVault), amount);
-        beefyVault.deposit(amount);
-        
-        // Calculate actual deposited amount
-        uint256 actualDeposit = beefyVault.balance() - balanceBefore;
-        emit BeefyDeposited(actualDeposit);
-    }
+        // Prepare swap data
+        IDeBridgeGate.SwapDescription memory desc = IDeBridgeGate.SwapDescription({
+            srcToken: address(wrappedSonic),
+            dstToken: address(USDC),
+            srcReceiver: address(this),
+            dstReceiver: address(this),
+            amount: amount,
+            minReturnAmount: 0, // Add slippage protection
+            guaranteedAmount: 0,
+            flags: 0,
+            referrer: address(0),
+            permit: ""
+        });
 
-    function withdrawFromBeefyVault(uint256 shares) external onlyRole(VAULT_ROLE) nonReentrant {
-        require(shares > 0, "Zero shares");
-        
-        uint256 balanceBefore = IERC20(address(wrappedSonic)).balanceOf(address(this));
-        beefyVault.withdraw(shares);
-        uint256 withdrawn = IERC20(address(wrappedSonic)).balanceOf(address(this)) - balanceBefore;
-        
-        emit BeefyWithdrawn(shares, withdrawn);
+        // Execute swap through OpenOcean
+        return debridge.swap(address(this), desc, new bytes[](0));
     }
-
+    
     function earn() external onlyRole(STRATEGIST_ROLE) nonReentrant {
         require(!paused, "Strategy is paused");
         beefyVault.earn();
@@ -246,5 +253,68 @@ contract SonicBeefyFarmStrategy is AccessControl, ReentrancyGuard {
             msg.sender == address(beefyVault),
             "Invalid sender"
         );
+    }
+
+    // Add ILending interface implementation
+    function deposit(address asset, uint256 amount) external onlyVault nonReentrant {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        require(amount > 0, "Zero amount");
+        require(!paused, "Strategy is paused");
+        
+        // Swap WSONIC to USDC.e locally
+        uint256 usdcAmount = _swapWSonicToUSDC(amount);
+        require(usdcAmount > 0, "Swap failed");
+        
+        // Get initial balance for actual deposit amount calculation
+        uint256 balanceBefore = beefyVault.balance();
+        
+        // Approve and deposit USDC.e
+        USDC.safeApprove(address(beefyVault), usdcAmount);
+        beefyVault.deposit(usdcAmount);
+        
+        // Calculate actual deposited amount
+        uint256 actualDeposit = beefyVault.balance() - balanceBefore;
+        emit BeefyDeposited(actualDeposit);
+    }
+
+    function withdraw(address asset, uint256 amount) external onlyVault nonReentrant {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        require(amount > 0, "Zero amount");
+        
+        // Calculate shares to withdraw based on amount
+        uint256 shares = (amount * beefyVault.totalSupply()) / beefyVault.balance();
+        
+        uint256 usdcBefore = USDC.balanceOf(address(this));
+        beefyVault.withdraw(shares);
+        uint256 usdcAmount = USDC.balanceOf(address(this)) - usdcBefore;
+        
+        // Swap USDC back to WSONIC
+        USDC.safeApprove(address(debridge), usdcAmount);
+        
+        IDeBridgeGate.SwapDescription memory swapDesc = IDeBridgeGate.SwapDescription({
+            srcToken: address(USDC),
+            dstToken: address(wrappedSonic),
+            srcReceiver: address(this),
+            dstReceiver: address(this),
+            amount: usdcAmount,
+            minReturnAmount: 0,
+            guaranteedAmount: 0,
+            flags: 0,
+            referrer: address(0),
+            permit: ""
+        });
+        
+        uint256 wsonicAmount = debridge.swap(address(this), swapDesc, new bytes[](0));
+        
+        // Transfer WSONIC back to vault
+        IERC20(address(wrappedSonic)).safeTransfer(msg.sender, wsonicAmount);
+        
+        emit BeefyWithdrawn(shares, wsonicAmount);
+    }
+
+    // Add this function to implement ILending interface
+    function getBalance(address asset) external view returns (uint256) {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        return beefyVault.balance();
     }
 }

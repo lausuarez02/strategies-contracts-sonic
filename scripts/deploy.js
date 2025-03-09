@@ -5,87 +5,98 @@ async function main() {
     console.log("Deploying contracts with the account:", deployer.address);
 
     // Important Sonic mainnet addresses
-    const WRAPPED_SONIC = "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38"; // Need Wrapped Sonic token address
-    const SFC = "0x0000000000000000000000000000000000000000"; // Need Sonic Foundation Contract address
-    const VALIDATOR_ID = 1; // Need your validator ID
-    const AAVE_POOL = "0x0000000000000000000000000000000000000000"; // Need Aave pool on Sonic
-    const DEBRIDGE = "0x0000000000000000000000000000000000000000"; // Need deBridge gateway on Sonic
-    const DESTINATION_CHAIN_ID = 1; // The chain ID you want to bridge to
-    const DESTINATION_TOKEN = "0x0000000000000000000000000000000000000000"; // Token address on destination chain
+    const VAULT_ADDRESS = "0x4BdE0740740b8dBb5f6Eb8c9ccB4Fc01171e953C";
+    const WRAPPED_SONIC = "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38";
+    const SFC = "0xFC00FACE00000000000000000000000000000000";
+    const VALIDATOR_ID = 16;
+    const DEBRIDGE_EXCHANGE = "0x6352a56caadC4F1E25CD6c75970Fa768A3304e64";
+    console.log("Using validator ID:", VALIDATOR_ID);
 
-    // Deploy Oracle first
-    console.log("Deploying Price Oracle...");
-    const PriceOracle = await ethers.getContractFactory("PriceOracle");
-    const oracle = await PriceOracle.deploy();
-    await oracle.waitForDeployment();
-    console.log("PriceOracle deployed to:", await oracle.getAddress());
+    // Arbitrum addresses
+    const ARBITRUM_AAVE_POOL = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
+    const ARBITRUM_DEBRIDGE = "0x43dE2d77BF8027e25dBD179B491e8d64f38398aA";
+    const ARBITRUM_CHAIN_ID = 42161;
+    const ARBITRUM_WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 
-    // Deploy Mock Tokens (for testing)
-    console.log("Deploying Mock Tokens...");
-    const MockToken = await ethers.getContractFactory("MockERC20");
-    const mockToken = await MockToken.deploy("Mock Token", "MTK");
-    await mockToken.waitForDeployment();
-    console.log("MockToken deployed to:", await mockToken.getAddress());
+    // Beefy USDC.e Silo vault address
+    const BEEFY_USDC_VAULT = "0xdb6E5dC4C6748EcECb97b565F6C074f24384fD07" // Need the actual vault address from Beefy
+    const USDC_ADDRESS = "0x29219dd400f2Bf60E5a23d13Be72B486D4038894";
+    try {
+        // Deploy Oracle first
+        console.log("Deploying Price Oracle...");
+        const PriceOracle = await ethers.getContractFactory("PriceOracle");
+        const oracle = await PriceOracle.deploy();
+        await oracle.waitForDeployment();
+        const oracleAddress = await oracle.getAddress();
+        console.log("PriceOracle deployed to:", oracleAddress);
 
-    // Deploy Beefy Vault and Strategy
-    console.log("Deploying Beefy components...");
-    const MockBeefy = await ethers.getContractFactory("MockBeefyVault");
-    const beefyVault = await MockBeefy.deploy(await mockToken.getAddress());
-    await beefyVault.waitForDeployment();
-    console.log("BeefyVault deployed to:", await beefyVault.getAddress());
+        // Deploy Main Sonic-Beefy Strategy
+        console.log("\nPreparing MainStrategy deployment with parameters:");
+        console.log("Vault (deployer):", deployer.address);
+        console.log("SFC:", SFC);
+        console.log("WRAPPED_SONIC:", WRAPPED_SONIC);
+        console.log("VALIDATOR_ID:", VALIDATOR_ID);
+        console.log("BeefyVault:", BEEFY_USDC_VAULT);
+        
+        console.log("\nDeploying Main Sonic-Beefy Strategy...");
+        const MainStrategy = await ethers.getContractFactory("SonicBeefyFarmStrategy");
+        const mainStrategy = await MainStrategy.deploy(
+            deployer.address,  // vault
+            SFC,              // sfc
+            WRAPPED_SONIC,    // wrappedSonic
+            VALIDATOR_ID,     // defaultValidatorId
+            BEEFY_USDC_VAULT, // beefyVault
+            DEBRIDGE_EXCHANGE,
+            USDC_ADDRESS
+        );
+        await mainStrategy.waitForDeployment();
+        const mainStrategyAddress = await mainStrategy.getAddress();
+        console.log("MainStrategy deployed to:", mainStrategyAddress);
 
-    // Deploy Main Sonic-Beefy Strategy
-    console.log("Deploying Main Sonic-Beefy Strategy...");
-    const MainStrategy = await ethers.getContractFactory("SonicBeefyFarmStrategy");
-    const mainStrategy = await MainStrategy.deploy(
-        deployer.address, // vault address - you'll need to update this
-        SFC,             // Sonic Foundation Contract
-        WRAPPED_SONIC,   // Wrapped Sonic token
-        VALIDATOR_ID,    // Your validator ID
-        "" // Beefy vault - you'll need this address
-    );
-    await mainStrategy.waitForDeployment();
-    console.log("MainStrategy deployed to:", await mainStrategy.getAddress());
+        // Deploy Aave-Sonic-Beefy Strategy
+        console.log("Deploying Aave-Sonic-Beefy Strategy...");
+        const AaveStrategy = await ethers.getContractFactory("AaveSonicBeefyStrategy");
+        const aaveStrategy = await AaveStrategy.deploy(
+            deployer.address,
+            ARBITRUM_WETH,
+            ARBITRUM_AAVE_POOL,
+            ARBITRUM_DEBRIDGE,
+            BEEFY_USDC_VAULT,
+            ARBITRUM_WETH,
+            oracleAddress,
+            ARBITRUM_CHAIN_ID,
+            WRAPPED_SONIC
+        );
+        await aaveStrategy.waitForDeployment();
+        const aaveStrategyAddress = await aaveStrategy.getAddress();
+        console.log("AaveStrategy deployed to:", aaveStrategyAddress);
 
-    // Deploy Aave-Sonic-Beefy Strategy
-    console.log("Deploying Aave-Sonic-Beefy Strategy...");
-    const AaveStrategy = await ethers.getContractFactory("AaveSonicBeefyStrategy");
-    const aaveStrategy = await AaveStrategy.deploy(
-        deployer.address, // vault - you'll need to update this
-        WRAPPED_SONIC,   // want token (Wrapped Sonic)
-        AAVE_POOL,      // Aave pool
-        DEBRIDGE,       // deBridge gateway
-        "", // Beefy vault - you'll need this address
-        WRAPPED_SONIC,   // wrapped native (Wrapped Sonic again)
-        await oracle.getAddress(), // price oracle we just deployed
-        DESTINATION_CHAIN_ID,
-        DESTINATION_TOKEN
-    );
-    await aaveStrategy.waitForDeployment();
-    console.log("AaveStrategy deployed to:", await aaveStrategy.getAddress());
+        // Set up price feeds in oracle
+        console.log("Setting up price feeds...");
+        await oracle.setFeed(
+            ARBITRUM_WETH,
+            "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"
+        );
 
-    // Set up price feeds in oracle
-    console.log("Setting up price feeds...");
-    await oracle.setFeed(
-        WRAPPED_SONIC,
-        "" // You'll need the Chainlink price feed address for Sonic
-    );
+        console.log("\nDeployment Summary:");
+        console.log("-------------------");
+        console.log("PriceOracle:", oracleAddress);
+        console.log("MainStrategy:", mainStrategyAddress);
+        console.log("AaveStrategy:", aaveStrategyAddress);
 
-    console.log("\nDeployment Summary:");
-    console.log("-------------------");
-    console.log("PriceOracle:", await oracle.getAddress());
-    console.log("MockToken:", await mockToken.getAddress());
-    console.log("BeefyVault:", await beefyVault.getAddress());
-    console.log("MainStrategy:", await mainStrategy.getAddress());
-    console.log("AaveStrategy:", await aaveStrategy.getAddress());
+        console.log("\nVerification commands:");
+        console.log("----------------------");
+        console.log(`npx hardhat verify --network mainnet ${oracleAddress}`);
+        console.log(`npx hardhat verify --network mainnet ${mainStrategyAddress} ${deployer.address} ${SFC} ${WRAPPED_SONIC} ${VALIDATOR_ID} ${BEEFY_USDC_VAULT} ${DEBRIDGE_EXCHANGE}`);
+        console.log(`npx hardhat verify --network mainnet ${aaveStrategyAddress} ${deployer.address} ${ARBITRUM_WETH} ${ARBITRUM_AAVE_POOL} ${ARBITRUM_DEBRIDGE} ${BEEFY_USDC_VAULT} ${ARBITRUM_WETH} ${oracleAddress} ${ARBITRUM_CHAIN_ID} ${WRAPPED_SONIC}`);
 
-    console.log("\nVerification commands:");
-    console.log("----------------------");
-    console.log(`npx hardhat verify --network mainnet ${await oracle.getAddress()}`);
-    
-    console.log(`npx hardhat verify --network mainnet ${await mainStrategy.getAddress()} ${deployer.address} ${SFC} ${WRAPPED_SONIC} ${VALIDATOR_ID} BEEFY_VAULT_ADDRESS`);
-    
-    console.log(`npx hardhat verify --network mainnet ${await aaveStrategy.getAddress()} ${deployer.address} ${WRAPPED_SONIC} ${AAVE_POOL} ${DEBRIDGE} BEEFY_VAULT_ADDRESS ${WRAPPED_SONIC} ${await oracle.getAddress()} ${DESTINATION_CHAIN_ID} ${DESTINATION_TOKEN}`);
+    } catch (error) {
+        console.error("\nDeployment failed with error:", error.message);
+        if (error.data) {
+            console.error("Error data:", error.data);
+        }
+        process.exit(1);
+    }
 }
 
 main()

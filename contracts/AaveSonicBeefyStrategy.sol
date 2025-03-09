@@ -3,230 +3,254 @@ pragma solidity ^0.8.13;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./interfaces/IStrategy.sol";
-import "./interfaces/IBeefyVault.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./interfaces/ILending.sol";
+import "./interfaces/IBeefyVaultV7.sol";
+import "./interfaces/IStrategyV7.sol";
+import "./interfaces/IWrappedSonic.sol";
 import "./interfaces/IAavePool.sol";
-import "./interfaces/IDebridgeGateway.sol";
-import "./interfaces/IWrappedNative.sol";
-import "./interfaces/IOracle.sol";
+import "./interfaces/IDeBridgeGate.sol";
 
-contract AaveSonicBeefyStrategy is IStrategy, AccessControl, ReentrancyGuard {
+contract AaveSonicBeefyStrategy is AccessControl, ReentrancyGuard, ILending {
     using SafeERC20 for IERC20;
 
     bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
-    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
     
-    address public immutable override vault;
-    IERC20 public immutable want;
+    IBeefyVaultV7 public beefyVault;
+    IStrategyV7 public beefyStrategy;
     IAavePool public immutable aavePool;
-    IDebridgeGateway public immutable deBridge;
-    IBeefyVault public immutable beefyVault;
-    IWrappedNative public immutable wrappedNative;
+    IWrappedSonic public immutable wrappedSonic;
+    IERC20 public immutable USDC;
+    IERC20 public immutable ARB_USDC;  // USDC on Arbitrum
+    IDeBridgeGate public immutable debridge;
     
-    uint256 public totalSupplied;
-    uint256 public totalBorrowed;
-    uint256 public constant MAX_BPS = 10000; // 100%
-    uint256 public borrowRatioBps = 7500; // 75% default borrow ratio
-    uint256 public destinationChainId;
-    
-    // Token mapping across chains
-    struct TokenInfo {
-        address sourceToken;      // Token on source chain
-        address destToken;        // Token on destination chain
-        uint256 minAmount;       // Minimum amount to bridge
-        uint256 maxAmount;       // Maximum amount to bridge
-    }
+    uint256 public constant ARBITRUM_CHAIN_ID = 42161;
+    bool public paused;
 
-    IOracle public immutable priceOracle;
-    mapping(uint256 => TokenInfo) public chainTokens;  // chainId => TokenInfo
-    
-    event Supplied(uint256 amount);
-    event Borrowed(uint256 amount);
-    event BridgedToDestination(
-        uint256 amount, 
-        uint256 chainId, 
-        uint256 sourcePrice,
-        address destToken
-    );
-    event Deposited(uint256 amount);
-    event Withdrawn(uint256 amount);
-    event Repaid(uint256 amount);
-    event BorrowRatioUpdated(uint256 newRatio);
+    event BridgedToArbitrum(uint256 amount);
+    event BridgedBackToSonic(uint256 amount);
+    event AaveDeposited(uint256 amount);
+    event AaveWithdrawn(uint256 amount);
+    event BeefyDeposited(uint256 amount);
+    event BeefyWithdrawn(uint256 shares, uint256 amount);
 
     constructor(
         address _vault,
-        address _want,
         address _aavePool,
-        address _deBridge,
+        address _wrappedSonic,
         address _beefyVault,
-        address _wrappedNative,
-        address _priceOracle,
-        uint256 _destinationChainId,
-        address _destToken
+        address _usdc,
+        address _arbUsdc,
+        address _deBridge
     ) {
-        require(_vault != address(0), "Invalid vault");
-        require(_want != address(0), "Invalid want token");
-        require(_aavePool != address(0), "Invalid Aave pool");
-        require(_deBridge != address(0), "Invalid deBridge");
-        require(_beefyVault != address(0), "Invalid Beefy vault");
+        require(_beefyVault != address(0), "Zero beefy vault");
+        require(_aavePool != address(0), "Zero aave pool");
+        require(_deBridge != address(0), "Zero deBridge");
+        require(_usdc != address(0), "Zero USDC");
+        require(_arbUsdc != address(0), "Zero ARB USDC");
         
-        vault = _vault;
-        want = IERC20(_want);
+        beefyVault = IBeefyVaultV7(_beefyVault);
+        beefyStrategy = IStrategyV7(beefyVault.strategy());
         aavePool = IAavePool(_aavePool);
-        deBridge = IDebridgeGateway(_deBridge);
-        beefyVault = IBeefyVault(_beefyVault);
-        wrappedNative = IWrappedNative(_wrappedNative);
-        destinationChainId = _destinationChainId;
-        priceOracle = IOracle(_priceOracle);
-        chainTokens[_destinationChainId] = TokenInfo({
-            sourceToken: _want,
-            destToken: _destToken,
-            minAmount: 1e18,      // 1 token minimum
-            maxAmount: 1000e18    // 1000 tokens maximum
-        });
+        wrappedSonic = IWrappedSonic(_wrappedSonic);
+        USDC = IERC20(_usdc);
+        ARB_USDC = IERC20(_arbUsdc);
+        debridge = IDeBridgeGate(_deBridge);
         
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(VAULT_ROLE, _vault);
-        _grantRole(MANAGER_ROLE, msg.sender);
+        _grantRole(STRATEGIST_ROLE, msg.sender);
     }
 
-    function beforeDeposit() external view override {
-        checkHealthFactor();
-    }
-
-    function getTokenPrice(address token) public view returns (uint256) {
-        return priceOracle.getPrice(token);
-    }
-
-    function deposit() external override onlyRole(VAULT_ROLE) {
-        uint256 wantBal = want.balanceOf(address(this));
-        if (wantBal > 0) {
-            // First supply to Aave
-            want.safeApprove(address(aavePool), wantBal);
-            aavePool.supply(address(want), wantBal, address(this), 0);
-            totalSupplied += wantBal;
-            emit Supplied(wantBal);
-
-            // Then borrow based on ratio
-            uint256 borrowAmount = (wantBal * borrowRatioBps) / MAX_BPS;
-            require(borrowAmount >= chainTokens[destinationChainId].minAmount, "Amount too low");
-            require(borrowAmount <= chainTokens[destinationChainId].maxAmount, "Amount too high");
-
-            // Get price before bridging
-            uint256 sourcePrice = getTokenPrice(address(want));
-            
-            // Bridge with token info
-            want.safeApprove(address(deBridge), borrowAmount);
-            deBridge.send(
-                address(want),
-                borrowAmount,
-                destinationChainId,
-                address(this),
-                abi.encode(sourcePrice, chainTokens[destinationChainId].destToken)
-            );
-            
-            emit BridgedToDestination(
-                borrowAmount, 
-                destinationChainId, 
-                sourcePrice,
-                chainTokens[destinationChainId].destToken
-            );
-
-            // Finally deposit bridged amount to Beefy on destination chain
-            // Note: This will happen on the destination chain after bridge
-            emit Deposited(borrowAmount);
-
-            totalBorrowed += borrowAmount;
-        }
-    }
-
-    function withdraw(uint256 _amount) external override onlyRole(VAULT_ROLE) {
-        require(_amount > 0, "Zero amount");
+    function deposit(address asset, uint256 amount) external override onlyRole(VAULT_ROLE) nonReentrant {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        require(amount > 0, "Zero amount");
+        require(!paused, "Strategy is paused");
         
-        // First withdraw from Beefy on destination chain and bridge back
-        uint256 borrowedToRepay = (_amount * totalBorrowed) / totalSupplied;
-        if (borrowedToRepay > 0) {
-            // Note: This assumes funds have been bridged back
-            
-            // Repay Aave
-            want.safeApprove(address(aavePool), borrowedToRepay);
-            aavePool.repay(address(want), borrowedToRepay, 2, address(this));
-            totalBorrowed -= borrowedToRepay;
-            emit Repaid(borrowedToRepay);
-        }
-
-        // Then withdraw from Aave
-        aavePool.withdraw(address(want), _amount, vault);
-        totalSupplied -= _amount;
-        emit Withdrawn(_amount);
-    }
-
-    function balanceOf() external view override returns (uint256) {
-        return totalSupplied - totalBorrowed + 
-               want.balanceOf(address(this));
-        // Note: Beefy balance is on destination chain
-    }
-
-    function retireStrat() external override {
-        require(msg.sender == vault, "!vault");
+        // 1. First swap WSONIC to USDC on Sonic
+        uint256 usdcAmount = _swapWSonicToUSDC(amount);
+        require(usdcAmount > 0, "Swap failed");
         
-        // This assumes all funds have been bridged back from destination chain
+        // 2. Bridge USDC to Arbitrum
+        uint256 bridgedAmount = _bridgeToArbitrum(usdcAmount);
+        emit BridgedToArbitrum(bridgedAmount);
         
-        // Repay all Aave debt
-        if (totalBorrowed > 0) {
-            want.safeApprove(address(aavePool), totalBorrowed);
-            aavePool.repay(address(want), totalBorrowed, 2, address(this));
-        }
-
-        // Withdraw all from Aave
-        if (totalSupplied > 0) {
-            aavePool.withdraw(address(want), totalSupplied, vault);
-        }
-
-        // Transfer any remaining balance
-        uint256 wantBal = want.balanceOf(address(this));
-        if (wantBal > 0) {
-            want.safeTransfer(vault, wantBal);
-        }
+        // 3. Deposit to Aave on Arbitrum (this will be executed on Arbitrum)
+        IERC20(ARB_USDC).safeApprove(address(aavePool), bridgedAmount);
+        aavePool.supply(address(ARB_USDC), bridgedAmount, address(this), 0);
+        emit AaveDeposited(bridgedAmount);
+        
+        // 4. Bridge rewards back to Sonic and deposit to Beefy
+        uint256 sonicAmount = _bridgeBackToSonic(bridgedAmount);
+        USDC.safeApprove(address(beefyVault), sonicAmount);
+        beefyVault.deposit(sonicAmount);
+        emit BeefyDeposited(sonicAmount);
     }
 
-    function checkHealthFactor() public view {
-        (,,,,, uint256 healthFactor) = aavePool.getUserAccountData(address(this));
-        require(healthFactor >= 1e18, "Unhealthy position");
+    function withdraw(address asset, uint256 amount) external override onlyRole(VAULT_ROLE) nonReentrant {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        require(amount > 0, "Zero amount");
+        
+        // Calculate amounts to withdraw from each protocol
+        uint256 totalUSDC = this.getBalance(address(USDC));
+        (uint256 aaveShare,,,,,) = aavePool.getUserAccountData(address(this));
+        uint256 beefyShare = beefyVault.balance();
+        
+        // 1. Withdraw from Aave on Arbitrum
+        uint256 aaveAmount = (amount * aaveShare) / totalUSDC;
+        aavePool.withdraw(address(ARB_USDC), aaveAmount, address(this));
+        emit AaveWithdrawn(aaveAmount);
+        
+        // 2. Bridge back to Sonic
+        uint256 bridgedBack = _bridgeBackToSonic(aaveAmount);
+        emit BridgedBackToSonic(bridgedBack);
+        
+        // 3. Withdraw from Beefy on Sonic
+        uint256 beefyAmount = (amount * beefyShare) / totalUSDC;
+        uint256 shares = (beefyAmount * beefyVault.totalSupply()) / beefyVault.balance();
+        beefyVault.withdraw(shares);
+        emit BeefyWithdrawn(shares, beefyAmount);
+        
+        // 4. Swap total USDC back to WSONIC
+        uint256 totalUSDCWithdrawn = USDC.balanceOf(address(this));
+        uint256 wsonicAmount = _swapUSDCToWSonic(totalUSDCWithdrawn);
+        
+        // Transfer WSONIC back to vault
+        IERC20(address(wrappedSonic)).safeTransfer(msg.sender, wsonicAmount);
     }
 
-    function setBorrowRatio(uint256 _newRatio) external onlyRole(MANAGER_ROLE) {
-        require(_newRatio <= MAX_BPS, "Invalid ratio");
-        borrowRatioBps = _newRatio;
-        emit BorrowRatioUpdated(_newRatio);
+    function getBalance(address asset) external view override returns (uint256) {
+        require(asset == address(wrappedSonic), "Invalid asset");
+        (uint256 aaveBalance,,,,,) = aavePool.getUserAccountData(address(this));
+        uint256 beefyBalance = beefyVault.balance();
+        return aaveBalance + beefyBalance;
     }
 
-    function setDestinationChainId(uint256 _chainId) external onlyRole(MANAGER_ROLE) {
-        destinationChainId = _chainId;
-    }
-
-    function setTokenInfo(
-        uint256 chainId,
-        address sourceToken,
-        address destToken,
-        uint256 minAmount,
-        uint256 maxAmount
-    ) external onlyRole(MANAGER_ROLE) {
-        chainTokens[chainId] = TokenInfo({
-            sourceToken: sourceToken,
-            destToken: destToken,
-            minAmount: minAmount,
-            maxAmount: maxAmount
+    function _bridgeToArbitrum(uint256 amount) internal returns (uint256) {
+        USDC.safeApprove(address(debridge), amount);
+        
+        bytes memory permitData = "";  // Add permit data if needed
+        
+        IDeBridgeGate.SubmissionParams memory autoParams = IDeBridgeGate.SubmissionParams({
+            executionFee: 0,
+            flags: 0,
+            fallbackAddress: abi.encodePacked(address(this)),
+            data: ""
         });
+        
+        // Bridge USDC to Arbitrum
+        debridge.send{value: 0}(
+            address(USDC),            // Token to send
+            amount,                   // Amount to bridge
+            ARBITRUM_CHAIN_ID,       // Destination chain (Arbitrum)
+            abi.encodePacked(address(this)),  // Receiver
+            "",                      // Native token to receive
+            permitData,              // Permit data
+            false,                   // Use async
+            0,                       // Referral code
+            autoParams               // Auto params
+        );
+        
+        return amount;  // Return bridged amount
     }
 
-    receive() external payable {
-        require(
-            msg.sender == address(wrappedNative) || 
-            msg.sender == address(beefyVault),
-            "Invalid sender"
+    function _bridgeBackToSonic(uint256 amount) internal returns (uint256) {
+        ARB_USDC.safeApprove(address(debridge), amount);
+        
+        bytes memory permitData = "";  // Add permit data if needed
+        
+        IDeBridgeGate.SubmissionParams memory autoParams = IDeBridgeGate.SubmissionParams({
+            executionFee: 0,
+            flags: 0,
+            fallbackAddress: abi.encodePacked(address(this)),
+            data: ""
+        });
+        
+        // Bridge back to Sonic
+        debridge.send{value: 0}(
+            address(ARB_USDC),       // Token to send
+            amount,                  // Amount to bridge
+            0,                       // Destination chain (Sonic)
+            abi.encodePacked(address(this)),  // Receiver
+            "",                      // Native token to receive
+            permitData,              // Permit data
+            false,                   // Use async
+            0,                       // Referral code
+            autoParams               // Auto params
         );
+        
+        return amount;  // Return bridged amount
+    }
+
+    function _swapWSonicToUSDC(uint256 amount) internal returns (uint256) {
+        require(amount > 0, "Zero amount");
+        
+        IERC20(address(wrappedSonic)).safeApprove(address(debridge), amount);
+        
+        IDeBridgeGate.SwapDescription memory desc = IDeBridgeGate.SwapDescription({
+            srcToken: address(wrappedSonic),
+            dstToken: address(USDC),
+            srcReceiver: address(this),
+            dstReceiver: address(this),
+            amount: amount,
+            minReturnAmount: 0,
+            guaranteedAmount: 0,
+            flags: 0,
+            referrer: address(0),
+            permit: ""
+        });
+
+        return debridge.swap(address(this), desc, new bytes[](0));
+    }
+
+    function _swapUSDCToWSonic(uint256 amount) internal returns (uint256) {
+        require(amount > 0, "Zero amount");
+        
+        USDC.safeApprove(address(debridge), amount);
+        
+        IDeBridgeGate.SwapDescription memory desc = IDeBridgeGate.SwapDescription({
+            srcToken: address(USDC),
+            dstToken: address(wrappedSonic),
+            srcReceiver: address(this),
+            dstReceiver: address(this),
+            amount: amount,
+            minReturnAmount: 0,
+            guaranteedAmount: 0,
+            flags: 0,
+            referrer: address(0),
+            permit: ""
+        });
+
+        return debridge.swap(address(this), desc, new bytes[](0));
+    }
+
+    // Admin functions
+    function setPaused(bool _paused) external onlyRole(STRATEGIST_ROLE) {
+        paused = _paused;
+    }
+
+    function emergencyWithdraw() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // Withdraw from both protocols
+        aavePool.withdraw(address(ARB_USDC), type(uint256).max, address(this));
+        beefyVault.withdrawAll();
+        
+        // Bridge back from Arbitrum if needed
+        uint256 arbBalance = ARB_USDC.balanceOf(address(this));
+        if (arbBalance > 0) {
+            _bridgeBackToSonic(arbBalance);
+        }
+        
+        // Transfer all tokens to admin
+        uint256 usdcBalance = USDC.balanceOf(address(this));
+        if (usdcBalance > 0) {
+            USDC.safeTransfer(msg.sender, usdcBalance);
+        }
+        
+        uint256 wsonicBalance = IERC20(address(wrappedSonic)).balanceOf(address(this));
+        if (wsonicBalance > 0) {
+            IERC20(address(wrappedSonic)).safeTransfer(msg.sender, wsonicBalance);
+        }
     }
 } 
