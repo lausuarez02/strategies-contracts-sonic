@@ -1,6 +1,6 @@
-# Cult of Ronin Strategy Contracts
+# Shogun Strategy Contracts
 
-Smart contracts for Cult of Ronin's yield farming strategies, enabling automated yield optimization across multiple protocols.
+Smart contracts for Shogun's yield farming strategies, enabling automated yield optimization across multiple protocols.
 
 ## Strategies
 
